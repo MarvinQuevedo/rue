@@ -24,8 +24,10 @@ pub enum Hir {
     First(HirId),
     Rest(HirId),
     Not(HirId),
+    Raise(Option<HirId>),
     Sha256(HirId),
     IsCons(HirId),
+    Strlen(HirId),
     If {
         condition: HirId,
         then_block: HirId,

@@ -104,8 +104,23 @@ pub enum DiagnosticInfo {
     #[error("unknown enum variant `{0}`")]
     UnknownEnumVariant(String),
 
-    #[error("only `Any` to `Bytes` or `(Any, Any)` type guards are implemented")]
-    UnsupportedTypeGuard,
+    #[error("cannot check type `{from}` against `{to}`")]
+    UnsupportedTypeGuard { from: String, to: String },
+
+    #[error("cannot check `Any` against pair with types other than `Any`")]
+    NonAnyPairTypeGuard,
+
+    #[error("cannot check list against pair with types other than the list item type and the list itself")]
+    NonListPairTypeGuard,
+
+    #[error("redundant check against same type `{0}`")]
+    RedundantTypeGuard(String),
+
+    #[error("implicit return is not allowed in if statements, use an explicit return statement")]
+    ImplicitReturnInIf,
+
+    #[error("explicit return is not allowed in expressions")]
+    ExplicitReturnInExpr,
 }
 
 /// Join a list of names into a string, wrapped in backticks.

@@ -9,10 +9,10 @@ use num_bigint::BigInt;
 use rowan::TextRange;
 use rue_parser::{
     AstNode, BinaryExpr, BinaryOp, Block, CastExpr, ConstItem, EnumItem, Expr, FieldAccess,
-    FunctionCall, FunctionItem, FunctionType as AstFunctionType, GuardExpr, IfExpr, IndexAccess,
-    InitializerExpr, InitializerField, Item, LambdaExpr, ListExpr, ListType, LiteralExpr, PairExpr,
-    PairType, Path, PrefixExpr, PrefixOp, Root, Stmt, StructField, StructItem, SyntaxKind,
-    SyntaxToken, Type as AstType, TypeAliasItem,
+    FunctionCall, FunctionItem, FunctionType as AstFunctionType, GroupExpr, GuardExpr, IfExpr,
+    IndexAccess, InitializerExpr, InitializerField, Item, LambdaExpr, LetStmt, ListExpr, ListType,
+    LiteralExpr, PairExpr, PairType, Path, PrefixExpr, PrefixOp, Root, Stmt, StructField,
+    StructItem, SyntaxKind, SyntaxToken, Type as AstType, TypeAliasItem,
 };
 
 use crate::{
@@ -33,6 +33,7 @@ pub struct Lowerer<'a> {
     int_type: TypeId,
     bool_type: TypeId,
     bytes_type: TypeId,
+    bytes32_type: TypeId,
     nil_type: TypeId,
     nil_hir: HirId,
     unknown_type: TypeId,
@@ -44,6 +45,7 @@ impl<'a> Lowerer<'a> {
         let int_type = db.alloc_type(Type::Int);
         let bool_type = db.alloc_type(Type::Bool);
         let bytes_type = db.alloc_type(Type::Bytes);
+        let bytes32_type = db.alloc_type(Type::Bytes32);
         let any_type = db.alloc_type(Type::Any);
         let nil_type = db.alloc_type(Type::Nil);
         let nil_hir = db.alloc_hir(Hir::Atom(Vec::new()));
@@ -55,6 +57,7 @@ impl<'a> Lowerer<'a> {
         builtins.define_type("Int".to_string(), int_type);
         builtins.define_type("Bool".to_string(), bool_type);
         builtins.define_type("Bytes".to_string(), bytes_type);
+        builtins.define_type("Bytes32".to_string(), bytes32_type);
         builtins.define_type("Any".to_string(), any_type);
 
         {
@@ -72,7 +75,7 @@ impl<'a> Lowerer<'a> {
                 db.alloc_symbol(Symbol::Function {
                     scope_id,
                     hir_id,
-                    ty: FunctionType::new(vec![bytes_type], bytes_type, false),
+                    ty: FunctionType::new(vec![bytes_type], bytes32_type, false),
                 }),
             );
         }
@@ -88,6 +91,7 @@ impl<'a> Lowerer<'a> {
             int_type,
             bool_type,
             bytes_type,
+            bytes32_type,
             nil_type,
             nil_hir,
             unknown_type,
@@ -275,7 +279,8 @@ impl<'a> Lowerer<'a> {
         };
 
         self.scope_stack.push(scope_id);
-        let output = self.compile_block_expr(body, None, Some(ty.return_type()));
+        let (output, _explicit_return) =
+            self.compile_block_expr(body, None, Some(ty.return_type()));
         self.scope_stack.pop().unwrap();
 
         self.type_check(
@@ -383,49 +388,153 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    fn compile_let_stmt(&mut self, let_stmt: LetStmt) -> Option<ScopeId> {
+        let expected_type = let_stmt.ty().map(|ty| self.compile_type(ty));
+
+        let value = let_stmt
+            .expr()
+            .map(|expr| self.compile_expr(expr, expected_type))
+            .unwrap_or(self.unknown());
+
+        if let Some(expected_type) = expected_type {
+            self.type_check(value.ty(), expected_type, let_stmt.syntax().text_range());
+        }
+
+        let Some(name) = let_stmt.name() else {
+            return None;
+        };
+
+        let symbol_id = self.db.alloc_symbol(Symbol::LetBinding {
+            type_id: expected_type.unwrap_or(value.ty()),
+            hir_id: value.hir(),
+        });
+
+        let mut let_scope = Scope::default();
+        let_scope.define_symbol(name.to_string(), symbol_id);
+        let scope_id = self.db.alloc_scope(let_scope);
+        self.scope_stack.push(scope_id);
+
+        Some(scope_id)
+    }
+
     fn compile_block_expr(
         &mut self,
         block: Block,
         scope_id: Option<ScopeId>,
         expected_type: Option<TypeId>,
-    ) -> Value {
+    ) -> (Value, bool) {
         if let Some(scope_id) = scope_id {
             self.scope_stack.push(scope_id);
         }
 
         self.compile_items(block.items());
 
-        let mut let_scope_ids = Vec::new();
+        enum Statement {
+            Let(ScopeId),
+            If(HirId, HirId),
+            Return(Value),
+        }
+
+        let mut statements = Vec::new();
+        let mut explicit_return = false;
 
         for stmt in block.stmts() {
             match stmt {
                 Stmt::LetStmt(let_stmt) => {
-                    let expected_type = let_stmt.ty().map(|ty| self.compile_type(ty));
-
-                    let value = let_stmt
-                        .expr()
-                        .map(|expr| self.compile_expr(expr, expected_type))
-                        .unwrap_or(self.unknown());
-
-                    if let Some(expected_type) = expected_type {
-                        self.type_check(value.ty(), expected_type, let_stmt.syntax().text_range());
-                    }
-
-                    let Some(name) = let_stmt.name() else {
+                    let Some(scope_id) = self.compile_let_stmt(let_stmt) else {
                         continue;
                     };
+                    statements.push(Statement::Let(scope_id));
+                }
+                Stmt::IfStmt(if_stmt) => {
+                    let condition = if_stmt
+                        .condition()
+                        .map(|condition| self.compile_expr(condition, Some(self.bool_type)));
 
-                    let symbol_id = self.db.alloc_symbol(Symbol::LetBinding {
-                        type_id: expected_type.unwrap_or(value.ty()),
-                        hir_id: value.hir(),
-                    });
+                    if let Some(condition) = condition.as_ref() {
+                        self.type_guards.push(condition.then_guards());
+                    }
 
-                    let mut let_scope = Scope::default();
-                    let_scope.define_symbol(name.to_string(), symbol_id);
-                    let scope_id = self.db.alloc_scope(let_scope);
-                    self.scope_stack.push(scope_id);
+                    let then_block = if_stmt
+                        .then_block()
+                        .map(|then_block| {
+                            let scope_id = self.db.alloc_scope(Scope::default());
+                            let (value, explicit_return) = self.compile_block_expr(
+                                then_block.clone(),
+                                Some(scope_id),
+                                expected_type,
+                            );
+                            if !explicit_return {
+                                self.error(
+                                    DiagnosticInfo::ImplicitReturnInIf,
+                                    then_block.syntax().text_range(),
+                                );
+                            }
+                            value
+                        })
+                        .unwrap_or_else(|| self.unknown());
 
-                    let_scope_ids.push(scope_id);
+                    if condition.is_some() {
+                        self.type_guards.pop().unwrap();
+                    }
+
+                    self.type_check(
+                        then_block.ty(),
+                        expected_type.unwrap_or(self.unknown_type),
+                        block.syntax().text_range(),
+                    );
+
+                    let else_guards = condition
+                        .as_ref()
+                        .map(|condition| condition.else_guards())
+                        .unwrap_or_default();
+
+                    self.type_guards.push(else_guards);
+
+                    statements.push(Statement::If(
+                        condition
+                            .map(|condition| condition.hir())
+                            .unwrap_or(self.unknown_hir),
+                        then_block.hir(),
+                    ));
+                }
+                Stmt::ReturnStmt(return_stmt) => {
+                    let value = return_stmt
+                        .expr()
+                        .map(|expr| self.compile_expr(expr, expected_type))
+                        .unwrap_or_else(|| self.unknown());
+
+                    explicit_return = true;
+
+                    statements.push(Statement::Return(value));
+                }
+                Stmt::RaiseStmt(raise_stmt) => {
+                    let value = raise_stmt
+                        .expr()
+                        .map(|expr| self.compile_expr(expr, Some(self.bytes_type)).hir());
+
+                    let value = self.db.alloc_hir(Hir::Raise(value));
+
+                    statements.push(Statement::Return(Value::typed(value, self.unknown_type)));
+                }
+                Stmt::AssertStmt(assert_stmt) => {
+                    let condition = assert_stmt
+                        .expr()
+                        .map(|condition| self.compile_expr(condition, Some(self.bool_type)))
+                        .unwrap_or_else(|| self.unknown());
+
+                    self.type_guards.push(condition.then_guards());
+
+                    self.type_check(
+                        condition.ty(),
+                        self.bool_type,
+                        assert_stmt.syntax().text_range(),
+                    );
+
+                    let not_condition = self.db.alloc_hir(Hir::Not(condition.hir()));
+                    let raise = self.db.alloc_hir(Hir::Raise(None));
+
+                    statements.push(Statement::If(not_condition, raise))
                 }
             }
         }
@@ -435,22 +544,41 @@ impl<'a> Lowerer<'a> {
             .map(|expr| self.compile_expr(expr, expected_type))
             .unwrap_or(self.unknown());
 
-        for scope_id in let_scope_ids.into_iter().rev() {
-            body = Value::typed(
-                self.db.alloc_hir(Hir::Scope {
-                    scope_id,
-                    value: body.hir(),
-                }),
-                body.ty(),
-            );
-            self.scope_stack.pop().unwrap();
+        for statement in statements.into_iter().rev() {
+            match statement {
+                Statement::Let(scope_id) => {
+                    body = Value::typed(
+                        self.db.alloc_hir(Hir::Scope {
+                            scope_id,
+                            value: body.hir(),
+                        }),
+                        body.ty(),
+                    );
+                    self.scope_stack.pop().unwrap();
+                }
+                Statement::Return(value) => {
+                    body = value;
+                }
+                Statement::If(condition, then_block) => {
+                    self.type_guards.pop().unwrap();
+
+                    body = Value::typed(
+                        self.db.alloc_hir(Hir::If {
+                            condition,
+                            then_block,
+                            else_block: body.hir(),
+                        }),
+                        body.ty(),
+                    );
+                }
+            }
         }
 
         if scope_id.is_some() {
             self.scope_stack.pop().unwrap();
         }
 
-        body
+        (body, explicit_return)
     }
 
     fn compile_expr(&mut self, expr: Expr, expected_type: Option<TypeId>) -> Value {
@@ -462,11 +590,20 @@ impl<'a> Lowerer<'a> {
             Expr::PairExpr(pair) => self.compile_pair_expr(pair, expected_type),
             Expr::Block(block) => {
                 let scope_id = self.db.alloc_scope(Scope::default());
-                self.compile_block_expr(block, Some(scope_id), expected_type)
+                let (value, explicit_return) =
+                    self.compile_block_expr(block.clone(), Some(scope_id), expected_type);
+                if explicit_return {
+                    self.error(
+                        DiagnosticInfo::ExplicitReturnInExpr,
+                        block.syntax().text_range(),
+                    );
+                }
+                value
             }
             Expr::LambdaExpr(lambda) => self.compile_lambda_expr(lambda, expected_type),
             Expr::PrefixExpr(prefix) => self.compile_prefix_expr(prefix),
             Expr::BinaryExpr(binary) => self.compile_binary_expr(binary),
+            Expr::GroupExpr(expr) => self.compile_group_expr(expr, expected_type),
             Expr::CastExpr(cast) => self.compile_cast_expr(cast, expected_type),
             Expr::GuardExpr(guard) => self.compile_guard_expr(guard, expected_type),
             Expr::IfExpr(if_expr) => self.compile_if_expr(if_expr, expected_type),
@@ -701,27 +838,15 @@ impl<'a> Lowerer<'a> {
         let ty = if binary.op() == Some(BinaryOp::Add)
             && self.is_assignable_to(lhs_ty, self.bytes_type, false, &mut HashSet::new())
         {
-            self.type_check(
-                rhs_ty,
-                self.bytes_type,
-                binary.rhs().unwrap().syntax().text_range(),
-            );
+            self.type_check(rhs_ty, self.bytes_type, binary.syntax().text_range());
 
             op = Some(HirBinaryOp::Concat);
 
             Some(self.bytes_type)
         } else {
-            self.type_check(
-                lhs_ty,
-                self.int_type,
-                binary.lhs().unwrap().syntax().text_range(),
-            );
+            self.type_check(lhs_ty, self.int_type, binary.syntax().text_range());
 
-            self.type_check(
-                rhs_ty,
-                self.int_type,
-                binary.rhs().unwrap().syntax().text_range(),
-            );
+            self.type_check(rhs_ty, self.int_type, binary.syntax().text_range());
 
             None
         };
@@ -758,6 +883,21 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    fn compile_group_expr(
+        &mut self,
+        group_expr: GroupExpr,
+        expected_type: Option<TypeId>,
+    ) -> Value {
+        let Some(expr) = group_expr
+            .expr()
+            .map(|expr| self.compile_expr(expr, expected_type))
+        else {
+            return self.unknown();
+        };
+
+        expr
+    }
+
     fn compile_cast_expr(&mut self, cast: CastExpr, expected_type: Option<TypeId>) -> Value {
         let Some(expr) = cast
             .expr()
@@ -789,57 +929,94 @@ impl<'a> Lowerer<'a> {
             .map(|ty| self.compile_type(ty))
             .unwrap_or(self.unknown_type);
 
-        if !matches!(self.db.ty(expr.ty()), Type::Any) {
-            self.error(
-                DiagnosticInfo::UnsupportedTypeGuard,
-                guard.syntax().text_range(),
-            );
+        let Some((guard, hir_id)) =
+            self.guard_into(expr.ty(), ty, expr.hir(), guard.syntax().text_range())
+        else {
             return Value::typed(self.unknown_hir, ty);
-        }
-
-        let (guard, hir_id) = match self.db.ty(ty) {
-            Type::Pair(first, rest) => {
-                if !matches!(self.db.ty(*first), Type::Any) {
-                    self.error(
-                        DiagnosticInfo::UnsupportedTypeGuard,
-                        guard.syntax().text_range(),
-                    );
-                    return Value::typed(self.unknown_hir, ty);
-                }
-
-                if !matches!(self.db.ty(*rest), Type::Any) {
-                    self.error(
-                        DiagnosticInfo::UnsupportedTypeGuard,
-                        guard.syntax().text_range(),
-                    );
-                    return Value::typed(self.unknown_hir, ty);
-                }
-
-                let hir_id = self.db.alloc_hir(Hir::IsCons(expr.hir()));
-                (Guard::new(ty, self.bytes_type), hir_id)
-            }
-            Type::Bytes => {
-                let pair_type = self.db.alloc_type(Type::Pair(self.any_type, self.any_type));
-                let is_cons = self.db.alloc_hir(Hir::IsCons(expr.hir()));
-                let hir_id = self.db.alloc_hir(Hir::Not(is_cons));
-                (Guard::new(ty, pair_type), hir_id)
-            }
-            _ => {
-                self.error(
-                    DiagnosticInfo::UnsupportedTypeGuard,
-                    guard.syntax().text_range(),
-                );
-                return Value::typed(self.unknown_hir, ty);
-            }
         };
 
-        let mut value = Value::typed(hir_id, self.unknown_type);
+        let mut value = Value::typed(hir_id, self.bool_type);
 
         if let Hir::Reference(symbol_id) = self.db.hir(expr.hir()) {
             value.guard(*symbol_id, guard);
         }
 
         value
+    }
+
+    fn guard_into(
+        &mut self,
+        from: TypeId,
+        to: TypeId,
+        hir_id: HirId,
+        text_range: TextRange,
+    ) -> Option<(Guard, HirId)> {
+        if self.types_equal(from, to) {
+            self.warning(
+                DiagnosticInfo::RedundantTypeGuard(self.type_name(from)),
+                text_range,
+            );
+            return Some((Guard::new(to, self.bool_type), hir_id));
+        }
+
+        match (self.db.ty(from).clone(), self.db.ty(to).clone()) {
+            (Type::Any, Type::Pair(first, rest)) => {
+                if !self.types_equal(first, self.any_type) {
+                    self.error(DiagnosticInfo::NonAnyPairTypeGuard, text_range);
+                }
+
+                if !self.types_equal(rest, self.any_type) {
+                    self.error(DiagnosticInfo::NonAnyPairTypeGuard, text_range);
+                }
+
+                let hir_id = self.db.alloc_hir(Hir::IsCons(hir_id));
+                Some((Guard::new(to, self.bytes_type), hir_id))
+            }
+            (Type::Any, Type::Bytes) => {
+                let pair_type = self.db.alloc_type(Type::Pair(self.any_type, self.any_type));
+                let is_cons = self.db.alloc_hir(Hir::IsCons(hir_id));
+                let hir_id = self.db.alloc_hir(Hir::Not(is_cons));
+                Some((Guard::new(to, pair_type), hir_id))
+            }
+            (Type::List(inner), Type::Pair(first, rest)) => {
+                if !self.types_equal(first, inner) {
+                    self.error(DiagnosticInfo::NonListPairTypeGuard, text_range);
+                }
+
+                if !self.types_equal(rest, from) {
+                    self.error(DiagnosticInfo::NonListPairTypeGuard, text_range);
+                }
+
+                let hir_id = self.db.alloc_hir(Hir::IsCons(hir_id));
+                Some((Guard::new(to, self.nil_type), hir_id))
+            }
+            (Type::List(inner), Type::Nil) => {
+                let pair_type = self.db.alloc_type(Type::Pair(inner, from));
+                let is_cons = self.db.alloc_hir(Hir::IsCons(hir_id));
+                let hir_id = self.db.alloc_hir(Hir::Not(is_cons));
+                Some((Guard::new(to, pair_type), hir_id))
+            }
+            (Type::Bytes, Type::Bytes32) => {
+                let strlen = self.db.alloc_hir(Hir::Strlen(hir_id));
+                let length = self.db.alloc_hir(Hir::Atom(vec![32]));
+                let hir_id = self.db.alloc_hir(Hir::BinaryOp {
+                    op: HirBinaryOp::Equals,
+                    lhs: strlen,
+                    rhs: length,
+                });
+                Some((Guard::new(to, from), hir_id))
+            }
+            _ => {
+                self.error(
+                    DiagnosticInfo::UnsupportedTypeGuard {
+                        from: self.type_name(from),
+                        to: self.type_name(to),
+                    },
+                    text_range,
+                );
+                None
+            }
+        }
     }
 
     fn compile_literal_expr(&mut self, literal: LiteralExpr) -> Value {
@@ -1055,7 +1232,7 @@ impl<'a> Lowerer<'a> {
     fn compile_if_expr(&mut self, if_expr: IfExpr, expected_type: Option<TypeId>) -> Value {
         let condition = if_expr
             .condition()
-            .map(|condition| self.compile_expr(condition, None));
+            .map(|condition| self.compile_expr(condition, Some(self.bool_type)));
 
         if let Some(condition) = condition.as_ref() {
             self.type_guards.push(condition.then_guards());
@@ -1064,6 +1241,7 @@ impl<'a> Lowerer<'a> {
         let then_block = if_expr.then_block().map(|then_block| {
             let scope_id = self.db.alloc_scope(Scope::default());
             self.compile_block_expr(then_block, Some(scope_id), expected_type)
+                .0
         });
 
         if condition.is_some() {
@@ -1074,9 +1252,13 @@ impl<'a> Lowerer<'a> {
             self.type_guards.push(condition.else_guards());
         }
 
+        let expected_type =
+            expected_type.or_else(|| then_block.as_ref().map(|then_block| then_block.ty()));
+
         let else_block = if_expr.else_block().map(|else_block| {
             let scope_id = self.db.alloc_scope(Scope::default());
             self.compile_block_expr(else_block, Some(scope_id), expected_type)
+                .0
         });
 
         if condition.is_some() {
@@ -1146,10 +1328,15 @@ impl<'a> Lowerer<'a> {
         let after_prefix = &text[1..];
         let before_suffix = after_prefix.strip_suffix(quote).unwrap_or(after_prefix);
 
+        let bytes = before_suffix.as_bytes();
+
         Value::typed(
-            self.db
-                .alloc_hir(Hir::Atom(before_suffix.as_bytes().to_vec())),
-            self.db.alloc_type(Type::Bytes),
+            self.db.alloc_hir(Hir::Atom(bytes.to_vec())),
+            if bytes.len() == 32 {
+                self.bytes32_type
+            } else {
+                self.bytes_type
+            },
         )
     }
 
@@ -1467,14 +1654,6 @@ impl<'a> Lowerer<'a> {
         visited_aliases: &mut HashSet<TypeId>,
     ) -> bool {
         match self.db.ty_raw(ty).clone() {
-            Type::Union(items) => {
-                for &item in items.iter() {
-                    if self.detect_cycle(item, text_range, visited_aliases) {
-                        return true;
-                    }
-                }
-                false
-            }
             Type::List(..) => false,
             Type::Pair(left, right) => {
                 self.detect_cycle(left, text_range, visited_aliases)
@@ -1491,7 +1670,13 @@ impl<'a> Lowerer<'a> {
                 }
                 self.detect_cycle(alias, text_range, visited_aliases)
             }
-            Type::Unknown | Type::Nil | Type::Any | Type::Int | Type::Bool | Type::Bytes => false,
+            Type::Unknown
+            | Type::Nil
+            | Type::Any
+            | Type::Int
+            | Type::Bool
+            | Type::Bytes
+            | Type::Bytes32 => false,
         }
     }
 
@@ -1519,14 +1704,7 @@ impl<'a> Lowerer<'a> {
             Type::Int => "Int".to_string(),
             Type::Bool => "Bool".to_string(),
             Type::Bytes => "Bytes".to_string(),
-            Type::Union(items) => {
-                let item_names: Vec<String> = items
-                    .iter()
-                    .map(|&ty| self.type_name_visitor(ty, stack))
-                    .collect();
-
-                item_names.join(" | ")
-            }
+            Type::Bytes32 => "Bytes32".to_string(),
             Type::List(items) => {
                 let inner = self.type_name_visitor(*items, stack);
                 format!("{}[]", inner)
@@ -1627,29 +1805,15 @@ impl<'a> Lowerer<'a> {
             (Type::Int, Type::Int) => true,
             (Type::Bool, Type::Bool) => true,
             (Type::Bytes, Type::Bytes) => true,
+            (Type::Bytes32, Type::Bytes32 | Type::Bytes) => true,
             (_, Type::Any) => true,
 
             // Primitive casts.
             (Type::Nil, Type::Bytes | Type::Bool | Type::Int) if cast => true,
             (Type::Int, Type::Bytes) if cast => true,
-            (Type::Bytes, Type::Int) if cast => true,
+            (Type::Bytes | Type::Bytes32, Type::Int) if cast => true,
             (Type::Bool, Type::Int | Type::Bytes) if cast => true,
             (Type::Any, _) if cast => true,
-
-            // Anything can be assigned to a union if it can be assigned to any of its items.
-            (_, Type::Union(items)) => {
-                for &item in items.iter() {
-                    if self.is_assignable_to(a, item, cast, visited) {
-                        return true;
-                    }
-                }
-                false
-            }
-
-            // Unions can be assigned to anything if all of its items can be assigned to it.
-            (Type::Union(items), _) => items
-                .iter()
-                .all(|&item| self.is_assignable_to(item, b, cast, visited)),
 
             // List types with compatible items are also assignable.
             (Type::List(a), Type::List(b)) => self.is_assignable_to(a, b, cast, visited),
@@ -1685,6 +1849,82 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    fn types_equal(&self, a: TypeId, b: TypeId) -> bool {
+        self.types_equal_visitor(a, b, &mut HashSet::new())
+    }
+
+    fn types_equal_visitor(
+        &self,
+        a_id: TypeId,
+        b_id: TypeId,
+        visited: &mut HashSet<(TypeId, TypeId)>,
+    ) -> bool {
+        let key = (a_id, b_id);
+
+        if a_id == b_id || visited.contains(&key) {
+            return true;
+        }
+        visited.insert(key);
+
+        let b = self.db.ty(b_id).clone();
+
+        let equal = match self.db.ty(a_id).clone() {
+            Type::Unknown => matches!(b, Type::Unknown),
+            Type::Any => matches!(b, Type::Any),
+            Type::Nil => matches!(b, Type::Nil),
+            Type::Int => matches!(b, Type::Int),
+            Type::Bool => matches!(b, Type::Bool),
+            Type::Bytes => matches!(b, Type::Bytes),
+            Type::Bytes32 => matches!(b, Type::Bytes32),
+            Type::Enum(..) | Type::EnumVariant(..) | Type::Struct(..) => a_id == b_id,
+            Type::List(inner) => {
+                if let Type::List(other_inner) = b {
+                    self.types_equal_visitor(inner, other_inner, visited)
+                } else {
+                    false
+                }
+            }
+            Type::Pair(left, right) => {
+                if let Type::Pair(other_left, other_right) = b {
+                    self.types_equal_visitor(left, other_left, visited)
+                        && self.types_equal_visitor(right, other_right, visited)
+                } else {
+                    false
+                }
+            }
+            Type::Function(fun) => {
+                if let Type::Function(other_fun) = b {
+                    if fun.parameter_types().len() != other_fun.parameter_types().len() {
+                        return false;
+                    }
+
+                    if fun.varargs() != other_fun.varargs() {
+                        return false;
+                    }
+
+                    for (a, b) in fun
+                        .parameter_types()
+                        .iter()
+                        .zip(other_fun.parameter_types().iter())
+                    {
+                        if !self.types_equal_visitor(*a, *b, visited) {
+                            return false;
+                        }
+                    }
+
+                    self.types_equal_visitor(fun.return_type(), other_fun.return_type(), visited)
+                } else {
+                    false
+                }
+            }
+            Type::Alias(..) => unreachable!(),
+        };
+
+        visited.remove(&key);
+
+        equal
+    }
+
     fn unknown(&self) -> Value {
         Value::typed(self.unknown_hir, self.unknown_type)
     }
@@ -1711,7 +1951,7 @@ impl<'a> Lowerer<'a> {
         ));
     }
 
-    fn _warning(&mut self, info: DiagnosticInfo, range: TextRange) {
+    fn warning(&mut self, info: DiagnosticInfo, range: TextRange) {
         self.diagnostics.push(Diagnostic::new(
             DiagnosticKind::Warning,
             info,

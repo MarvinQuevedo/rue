@@ -85,6 +85,7 @@ ast_enum!(
     LambdaExpr,
     PrefixExpr,
     BinaryExpr,
+    GroupExpr,
     CastExpr,
     GuardExpr,
     IfExpr,
@@ -100,6 +101,7 @@ ast_node!(ListItem);
 ast_node!(PairExpr);
 ast_node!(PrefixExpr);
 ast_node!(BinaryExpr);
+ast_node!(GroupExpr);
 ast_node!(CastExpr);
 ast_node!(GuardExpr);
 ast_node!(IfExpr);
@@ -118,8 +120,12 @@ ast_node!(PairType);
 ast_node!(FunctionType);
 ast_node!(FunctionTypeParam);
 
-ast_enum!(Stmt, LetStmt);
+ast_enum!(Stmt, LetStmt, IfStmt, ReturnStmt, RaiseStmt, AssertStmt);
 ast_node!(LetStmt);
+ast_node!(IfStmt);
+ast_node!(ReturnStmt);
+ast_node!(RaiseStmt);
+ast_node!(AssertStmt);
 
 impl Root {
     pub fn items(&self) -> Vec<Item> {
@@ -315,6 +321,34 @@ impl LetStmt {
     }
 }
 
+impl IfStmt {
+    pub fn condition(&self) -> Option<Expr> {
+        self.syntax().children().find_map(Expr::cast)
+    }
+
+    pub fn then_block(&self) -> Option<Block> {
+        self.syntax().children().find_map(Block::cast)
+    }
+}
+
+impl ReturnStmt {
+    pub fn expr(&self) -> Option<Expr> {
+        self.syntax().children().find_map(Expr::cast)
+    }
+}
+
+impl RaiseStmt {
+    pub fn expr(&self) -> Option<Expr> {
+        self.syntax().children().find_map(Expr::cast)
+    }
+}
+
+impl AssertStmt {
+    pub fn expr(&self) -> Option<Expr> {
+        self.syntax().children().find_map(Expr::cast)
+    }
+}
+
 impl InitializerExpr {
     pub fn path(&self) -> Option<Path> {
         self.syntax().children().find_map(Path::cast)
@@ -435,6 +469,12 @@ impl BinaryExpr {
 
     pub fn rhs(&self) -> Option<Expr> {
         self.syntax().children().filter_map(Expr::cast).nth(1)
+    }
+}
+
+impl GroupExpr {
+    pub fn expr(&self) -> Option<Expr> {
+        self.syntax().children().find_map(Expr::cast)
     }
 }
 
